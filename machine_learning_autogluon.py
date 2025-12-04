@@ -14,7 +14,7 @@ from config.config_loader import load_config
 
 
 # =============================================================
-#                    配置与数据加载
+#                    CONFIGURATION & DATA LOADING
 # =============================================================
 FILE_NAME = "whole_feature_120_1_new.csv"
 RESULT_CSV = "model_results_final111.csv"
@@ -27,13 +27,14 @@ n_splits = 10
 n_jobs = 20
 
 
-# ------------------- 读取数据 -------------------
+# -------- Load feature dataset -------- #
 df = pd.read_csv(FILE_NAME)
 
-# 删除 DACSmm 特征
+# Remove raw eye-position features measured in DACSmm (low usability, redundant)
 df = df.drop(columns=[c for c in df.columns if "DACSmm" in c])
 
-# ------------------- 读取受试者数量 -------------------
+
+# -------- Load participant configuration -------- #
 CONFIG_DATA = load_config(os.path.join("config", "feature_engineering_config.json"))
 NC_number = CONFIG_DATA["NC_number"]
 PD_number = CONFIG_DATA["PD_number"]
@@ -42,7 +43,7 @@ nc_subjects = [f"NC P{i}" for i in range(1, NC_number + 1)]
 pd_subjects = [f"PD P{i}" for i in range(1, PD_number + 1)]
 all_subjects = nc_subjects + pd_subjects
 
-# 排除的受试者
+# Remove subjects with high eye-tracking data loss
 exclude_subjects1 = [
     "NC P16","NC P26","NC P8",
     "PD P18","PD P1","PD P2","PD P4","PD P21","PD P26",
@@ -52,8 +53,9 @@ all_subjects = [s for s in all_subjects if s not in exclude_subjects1]
 
 
 # =============================================================
-#                 特征分组（Feature Groups）
+#                    FEATURE GROUP DEFINITION
 # =============================================================
+# Group features by sensing modality (steering, pedal, speed, eye/head)
 groups = {
     "steering_all": [
         c for c in df.columns if c.startswith(
@@ -75,8 +77,6 @@ groups = {
     ]
 }
 
-eye_groups = {"evemovement", "gaze_event", "head_movement", "evemovement_all"}
-
 print("\n=========== Feature Group Summary ===========")
 for g, cols in groups.items():
     print(f"{g}: {len(cols)} features")
@@ -84,8 +84,9 @@ print("=============================================\n")
 
 
 # =============================================================
-#                 构造全部特征组合
+#                    FEATURE GROUP COMBINATIONS
 # =============================================================
+# Build all combinations of ≥4 sensing modalities
 combo_groups = {}
 group_names = list(groups.keys())
 
@@ -98,9 +99,11 @@ print(f"Total {len(combo_groups)} feature combinations.\n")
 
 
 # =============================================================
-#         核心函数：单折训练（AutoGluon Default）
+#      CORE: Single-Fold Training using AutoGluon Tabular
 # =============================================================
 def run_fold(train_index, test_index, subject_list, df, cols, label_col, n_jobs):
+    """Leave-subject-out learning: train on subjects in train_index and test on others"""
+    
     train_subjects = [subject_list[i] for i in train_index]
     test_subjects = [subject_list[i] for i in test_index]
 
@@ -110,9 +113,11 @@ def run_fold(train_index, test_index, subject_list, df, cols, label_col, n_jobs)
     if df_train.empty or df_test.empty:
         return None
 
+    # Create unique folder for AutoGluon model serialization
     fold_model_path = os.path.join(SAVE_DIR, f"fold_{os.getpid()}_{len(train_subjects)}")
     os.makedirs(fold_model_path, exist_ok=True)
 
+    # Train AutoGluon using default model ensemble (no stacking/bagging)
     predictor = TabularPredictor(
         label=label_col,
         eval_metric="roc_auc",
@@ -126,7 +131,6 @@ def run_fold(train_index, test_index, subject_list, df, cols, label_col, n_jobs)
         verbosity=0
     )
 
-    # ========= 关键更新：兼容所有 AutoGluon 版本 =========
     model_list = predictor.leaderboard(silent=True)["model"].tolist()
 
     results = {}
@@ -135,25 +139,21 @@ def run_fold(train_index, test_index, subject_list, df, cols, label_col, n_jobs)
 
         preds = predictor.predict(df_test, model=model_name)
         proba = predictor.predict_proba(df_test, model=model_name).values
-
         y_test = df_test[label_col].values
 
-        # 基础指标
+        # Performance metrics
         acc = accuracy_score(y_test, preds)
         f1 = f1_score(y_test, preds, average="macro")
-
-        # AUC
         try:
             auc = roc_auc_score(y_test, proba[:, 1])
         except:
             auc = np.nan
 
-        # Sensitivity, Specificity
+        # Sensitivity & specificity
         tn, fp, fn, tp = confusion_matrix(y_test, preds).ravel()
         sens = tp / (tp + fn + 1e-9)
         spec = tn / (tn + fp + 1e-9)
 
-        # 保存该模型结果
         results[model_name] = {
             "acc": acc,
             "f1": f1,
@@ -169,7 +169,7 @@ def run_fold(train_index, test_index, subject_list, df, cols, label_col, n_jobs)
 
 
 # =============================================================
-#                     主循环：遍历特征组
+#                 MAIN LOOP: CV OVER GROUPS
 # =============================================================
 all_results = []
 
@@ -187,7 +187,6 @@ for feature_group_name, cols in tqdm(combo_groups.items(), desc="Feature Group L
 
     fold_outputs = [fr for fr in fold_outputs if fr is not None]
 
-    # ========== 汇总所有模型 ==========
     model_names = fold_outputs[0]["fold_model_scores"].keys()
 
     for model_name in model_names:
@@ -217,8 +216,9 @@ for feature_group_name, cols in tqdm(combo_groups.items(), desc="Feature Group L
 
         all_results.append(result_row)
 
-# 保存 CSV
+
+# Save final aggregated table
 results_df = pd.DataFrame(all_results)
 results_df.to_csv(RESULT_CSV, index=False)
 
-print(f"\n======= ALL RESULTS SAVED to {RESULT_CSV} =======\n")
+print(f"\n======== ALL RESULTS SAVED TO {RESULT_CSV} ========\n")

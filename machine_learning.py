@@ -26,25 +26,29 @@ from xgboost import XGBClassifier
 from config.config_loader import load_config
 
 
-# ====================== 读取与处理数据 ======================
+# ====================== Load and preprocess feature dataset ====================== #
 file_name = "whole_feature_120_1_new.csv"
 df = pd.read_csv(file_name)
 
+# Drop raw-eye-position features measured in DACSmm (highly correlated)
 columns_to_remove = [col for col in df.columns if 'DACSmm' in col]
 df = df.drop(columns=columns_to_remove)
 
 results_file_path = "model_results_new_11111.csv"
-# model_name = "logistic regression"
-
-# save_dir = "./" + model_name
-# os.makedirs(save_dir, exist_ok=True)
 
 cv_strategy = "kfold"
 n_splits = 10
 label_col = "label"
 
-# ====================== 构建模型流水线 ======================
+
+# ====================== Model builder with unified preprocessing ====================== #
 def make_model_pipeline(model_name: str):
+    """
+    Build sklearn model pipeline with:
+        - Missing-value imputation
+        - Feature standardization
+        - Classifier
+    """
     model_name = model_name.lower()
 
     if model_name == "logistic regression":
@@ -84,12 +88,14 @@ def make_model_pipeline(model_name: str):
     return model
 
 
-# ====================== 特征分组 ======================
+# ====================== Feature grouping by modality ====================== #
+# Used for evaluating different sensor combinations
 groups = {
     "steering_all": [
         col for col in df.columns
-        if col.startswith(("STATSPNEW_steering","STATSP_steering",
-                           "FFT_steering","WVL_steering","NewPedal_steering","LAST_steer"))
+        if col.startswith(("STATSPNEW_steering", "STATSP_steering",
+                           "FFT_steering", "WVL_steering",
+                           "NewPedal_steering", "LAST_steer"))
     ],
     "pedal_all": [
         col for col in df.columns
@@ -112,7 +118,7 @@ for group_name, cols in groups.items():
     print(f"{group_name}: {len(cols)} parameters")
 
 
-# ====================== 受试者数据 ======================
+# ====================== Subject metadata loaded from config ====================== #
 CONFIG_DATA = load_config(os.path.join("config", "feature_engineering_config.json"))
 NC_number = CONFIG_DATA["NC_number"]
 PD_number = CONFIG_DATA["PD_number"]
@@ -121,18 +127,20 @@ nc_subjects_all = [f"NC P{i}" for i in range(1, NC_number+1)]
 pd_subjects_all = [f"PD P{i}" for i in range(1, PD_number+1)]
 all_subjects = nc_subjects_all + pd_subjects_all
 
-#exclude eyemovement loss rate over 50%
+# Exclude subjects with >50% gaze loss
 exclude_subjects1 = [
     "NC P16","NC P26","NC P8","PD P18","PD P1","PD P2",
     "PD P4","PD P21","PD P26","NC P18"
 ]
-
 all_subjects = [s for s in all_subjects if s not in exclude_subjects1]
 
-eye_groups = {"evemovement", "gaze_event", "head_movement", "evemovement_all"}
 
-# ====================== 单折训练函数 ======================
+# ====================== Single fold execution function ====================== #
 def run_fold(train_index, test_index, all_subjects_filtered, df, cols, label_col, model_name):
+    """
+    Train on subjects in train_index and test on subjects in test_index.
+    Leave-subject-out style: no sample leakage.
+    """
     train_subjects = [all_subjects_filtered[i] for i in train_index]
     test_subjects = [all_subjects_filtered[i] for i in test_index]
 
@@ -154,7 +162,10 @@ def run_fold(train_index, test_index, all_subjects_filtered, df, cols, label_col
     model.fit(X_train, y_train)
 
     y_pred = model.predict(X_test)
-    y_score = model.predict_proba(X_test) if hasattr(model, "predict_proba") else model.decision_function(X_test)
+    if hasattr(model, "predict_proba"):
+        y_score = model.predict_proba(X_test)
+    else:
+        y_score = model.decision_function(X_test)
 
     result = {
         "acc": accuracy_score(y_test, y_pred),
@@ -164,6 +175,7 @@ def run_fold(train_index, test_index, all_subjects_filtered, df, cols, label_col
         "subject": test_subjects,
     }
 
+    # Binary metrics
     if len(np.unique(y_test)) == 2:
         sens = recall_score(y_test, y_pred, pos_label=1)
         tn, fp, fn, tp = confusion_matrix(y_test, y_pred).ravel()
@@ -179,7 +191,8 @@ def run_fold(train_index, test_index, all_subjects_filtered, df, cols, label_col
     return result
 
 
-# ====================== 构造组合特征 ======================
+# ====================== Build feature combinations ====================== #
+# Combine 4 modalities: evaluate all ≥4 combinations
 combo_groups = {}
 group_names = list(groups.keys())
 
@@ -189,7 +202,7 @@ for r in range(4, len(group_names) + 1):
         combo_groups[combo_name] = [col for g in combo for col in groups[g]]
 
 
-# ====================== ROC 绘图（未使用但保留） ======================
+# ====================== Optional ROC plot function (unused in pipeline) ====================== #
 def plot_mean_roc(y_true_all, y_score_all, auc_list, title="Early Warning", save_path=None):
     mean_fpr = np.linspace(0, 1, 100)
     tprs = []
@@ -208,7 +221,6 @@ def plot_mean_roc(y_true_all, y_score_all, auc_list, title="Early Warning", save
     plt.plot(mean_fpr, mean_tpr, lw=2)
     plt.fill_between(mean_fpr, np.maximum(mean_tpr - std_tpr, 0),
                      np.minimum(mean_tpr + std_tpr, 1), alpha=0.3)
-
     plt.plot([0, 1], [0, 1], "--", color="gray")
 
     mean_auc = np.mean(auc_list)
@@ -219,15 +231,16 @@ def plot_mean_roc(y_true_all, y_score_all, auc_list, title="Early Warning", save
     plt.xlabel("1 - Specificity")
     plt.ylabel("Sensitivity")
     plt.title(title)
-
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
-
     plt.close()
 
 
-# ====================== 主循环：遍历模型与特征 ======================
-model_names = ["logistic regression","elasticnet","ridge","svm","mlp","random forest","gradient boosting","xgboost"]
+# ====================== Main evaluation loop: models × feature sets ====================== #
+model_names = [
+    "logistic regression", "elasticnet", "ridge", "svm",
+    "mlp", "random forest", "gradient boosting", "xgboost"
+]
 n_jobs = 15
 
 for model_name in model_names:
@@ -235,7 +248,6 @@ for model_name in model_names:
 
     for name, cols in tqdm(combo_groups.items(), desc="Feature Groups"):
         acc_list, f1_list, sens_list, spec_list, auc_list = [], [], [], [], []
-        subject_auc = []
         y_true_all, y_score_all = [], []
 
         if cv_strategy == "kfold":
@@ -264,7 +276,6 @@ for model_name in model_names:
                 sens_list.append(fr["sens"])
                 spec_list.append(fr["spec"])
                 auc_list.append(fr["auc"])
-                subject_auc.append((fr["subject"][0], fr["auc"]))
 
         y_true_all = np.array(y_true_all)
         y_score_all = np.array(y_score_all)
@@ -273,7 +284,10 @@ for model_name in model_names:
             if len(np.unique(y_true_all)) == 2:
                 auroc = roc_auc_score(y_true_all, y_score_all[:, 1])
             else:
-                auroc = roc_auc_score(y_true_all, y_score_all, multi_class="ovr", average="macro")
+                auroc = roc_auc_score(
+                    y_true_all, y_score_all,
+                    multi_class="ovr", average="macro"
+                )
         except:
             auroc = np.nan
 
@@ -290,7 +304,6 @@ for model_name in model_names:
             "specificity_mean": np.mean(spec_list) if spec_list else np.nan,
             "acc_each_fold": [round(a, 2) for a in acc_list],
             "auc_each_fold": [round(a, 2) if not np.isnan(a) else np.nan for a in auc_list],
-            "subject_auc": subject_auc
         })
 
     results_df = pd.DataFrame(results)
